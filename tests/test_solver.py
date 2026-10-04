@@ -341,9 +341,71 @@ def test_max_size_instance_performance():
     start = time.monotonic()
     result = invert_payload(payload)
     elapsed = time.monotonic() - start
-    assert elapsed < 10.0
+    # 上限规模（12 段、20 窗、±100000 应变域）合法可行请求须在产品 3 秒
+    # 截止内返回精确三级最优解。
+    assert elapsed < 3.0
+    strains = result["strains"]
     assert all(c["satisfied"] for c in result["window_checks"])
-    assert len(result["strains"]) == 12
+    assert len(strains) == 12
+    # 逐窗回算均须落入提交闭区间，且与响应中的加权和一致。
+    for check, win in zip(result["window_checks"], windows):
+        total = sum(
+            lengths[i] * strains[i]
+            for i in range(win["start_segment"] - 1, win["end_segment"])
+        )
+        assert check["weighted_strain_sum"] == total
+        assert win["min_elongation"] <= total <= win["max_elongation"]
+    # 两级平滑指标可由相邻差直接复核；结果须确定（重复调用一致）。
+    diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
+    assert result["objectives"]["max_adjacent_diff"] == max(abs(d) for d in diffs)
+    assert result["objectives"]["sum_adjacent_abs_diff"] == sum(abs(d) for d in diffs)
+    assert invert_payload(payload)["strains"] == strains
+
+
+def test_max_size_small_strain_domain_performance():
+    """12 段、20 窗、小应变闭区间的可行实例同样须在 3 秒内返回精确最优。"""
+    for seed in (0, 3, 4, 5):
+        rng = random.Random(seed)
+        n = 12
+        lengths = [rng.randint(1, 100) for _ in range(n)]
+        bound = 10
+        truth = [rng.randint(-5, 5) for _ in range(n)]
+        windows = []
+        starts = list(range(n))
+        rng.shuffle(starts)
+        for s0 in starts:
+            e0 = rng.randint(s0, n - 1)
+            total = sum(lengths[i] * truth[i] for i in range(s0, e0 + 1))
+            windows.append(
+                {"start_segment": s0 + 1, "end_segment": e0 + 1,
+                 "min_elongation": total - 100, "max_elongation": total + 100}
+            )
+        while len(windows) < 20:
+            s0 = rng.randint(0, n - 1)
+            e0 = rng.randint(s0, n - 1)
+            total = sum(lengths[i] * truth[i] for i in range(s0, e0 + 1))
+            windows.append(
+                {"start_segment": s0 + 1, "end_segment": e0 + 1,
+                 "min_elongation": total - 50, "max_elongation": total + 50}
+            )
+        payload = {
+            "segment_lengths": lengths,
+            "strain_bounds": {"min": -bound, "max": bound},
+            "windows": windows,
+        }
+        start = time.monotonic()
+        result = invert_payload(payload)
+        assert time.monotonic() - start < 3.0
+        strains = result["strains"]
+        assert len(strains) == n
+        assert all(-bound <= v <= bound for v in strains)
+        for check, win in zip(result["window_checks"], windows):
+            total = sum(
+                lengths[i] * strains[i]
+                for i in range(win["start_segment"] - 1, win["end_segment"])
+            )
+            assert check["weighted_strain_sum"] == total
+            assert win["min_elongation"] <= total <= win["max_elongation"]
 
 
 def test_deterministic():
