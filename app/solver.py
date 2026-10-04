@@ -27,18 +27,20 @@
 1. 最小化相邻段最大应变差 M = max_k |x_k - x_{k-1}|
    —— 在 x 空间就是差分约束 x_k - x_{k-1} ∈ [-M, M]，同样并入最长路闭包。
 2. 在 1 的最优解中最小化 S = Σ_k |x_k - x_{k-1}|
-   —— M 较小时在差分空间 (x0,d_k) 直接以 Σ|d_k| 的一元域收紧精确判定；
-      M 很大时用辅助变量 e_k ≥ |Δ_k|、Σe_k≤S 的线性松弛（精确等价）。
+   —— 在 (x,d) 联合空间求解：观测窗约束保留 x 恒等系数（界传播最
+      直接、最紧），d_k=x_k-x_{k-1} 经精确连接等式挂载并直接承载
+      Σ|d_k|（无松弛辅助变量、无重复解）。全部 d_k 符号定后，
+      Σ|d_k| 化为 x 上的短系数线性等式参与传播；未定时按 d 符号分支。
 3. 在 1、2 的最优解中取应变序列 (x_0,...,x_{n-1}) 字典序最小者。
 
 求解：
 - 最长路闭包缩域 + 整数界传播（含精确等式的丢番图余数类传播）+ MRV
-  /折半回溯；
+  /折半回溯；界传播采用 AC-3 式增量队列，静态变量→约束索引整树复用；
 - 纯整数（奇偶/模）矛盾先在一组小素数有限域上做高斯消元预检截杀，
   覆盖差分闭包（仅实值域）无法识别的「系数偶、右端奇」一类冲突；
 - 最小 M、最小 S 及字典序各值均利用「可行性关于阈值单调」二分钉死，
-  可行试解带回的实际目标值直接收紧上界；
-- 阶段 2/3 按域宽在「差分空间 / x 空间」间自适应选择；
+  可行试解带回的实际目标值直接收紧上界；M 的起点用闭包（无回溯）
+  一致性下界，避免在差分约束失效的全量程上盲搜；
 - 重复观测窗在求解侧按 (段范围, 区间) 去重，结果仍逐窗回算。
 """
 
@@ -420,144 +422,186 @@ def _x_diff_closure(
 Constraint = tuple[tuple[tuple[int, int], ...], int | None, int | None]
 
 
+def _revise(
+    los: list[int],
+    his: list[int],
+    terms: tuple[tuple[int, int], ...],
+    a: int | None,
+    b: int | None,
+) -> list[int] | None:
+    """按一条线性区间约束收紧各变量一元域（原地）；矛盾返回 None。
+
+    扫描其项两遍：第一遍求和的整体包络 [smin,smax]、自由变量包络与
+    系数 gcd；第二遍用「总和减去本项」做一元界收紧。返回本轮被收紧
+    （任一界变化）的变量下标列表，供增量队列调度相邻约束。
+    """
+    # 变量划分在本次修订开始时快照：即使本轮把某变量收紧成单点，
+    # 也要等下次修订再重算包络，避免 fixed/free 口径中途不一致。
+    fixed = 0
+    free_terms: list[tuple[int, int]] = []
+    free_min = 0
+    free_max = 0
+    g = 0
+    for j, w in terms:
+        if los[j] == his[j]:
+            fixed += w * los[j]
+        else:
+            free_terms.append((j, w))
+            g = gcd(g, abs(w))
+            if w > 0:
+                free_min += w * los[j]
+                free_max += w * his[j]
+            else:
+                free_min += w * his[j]
+                free_max += w * los[j]
+    smin = free_min + fixed
+    smax = free_max + fixed
+    # gcd/包络快判：自由变量之和必为系数 gcd 的倍数，且必落在
+    # 其当前一元界包络内；与残差区间不交即矛盾（单点变量也在此
+    # 被核对，故后加入的精确约束与其冲突时不会漏检）。
+    rlo = None if a is None else a - fixed
+    rhi = None if b is None else b - fixed
+    lo_bound = free_min if rlo is None else max(free_min, rlo)
+    hi_bound = free_max if rhi is None else min(free_max, rhi)
+    if lo_bound > hi_bound:
+        return None
+    if g > 1:
+        first = lo_bound + ((-lo_bound) % g)
+        if first > hi_bound:
+            return None
+    touched: list[int] = []
+    # 精确等式（lo==hi）的丢番图余数传播：其余自由变量系数的
+    # gcd g_j 决定 w_j·x_j 的余数类，据此把 x_j 的一元域收紧到
+    # 某个同余类（区间约束的右端不唯一时一般无此强结论，故仅对
+    # 等式做），显著压缩「精确观测窗」的回溯空间。
+    # 用前缀/后缀 gcd 令每个 g_j 只花 O(1)（整体 O(自由项数)）。
+    exact = a is not None and a == b
+    nf = len(free_terms)
+    if exact and nf >= 2:
+        pref = [0] * (nf + 1)
+        for t in range(nf):
+            pref[t + 1] = gcd(pref[t], abs(free_terms[t][1]))
+        suffix_g = 0
+        gjs: list[int] = [0] * nf
+        for t in range(nf - 1, -1, -1):
+            gjs[t] = gcd(pref[t], suffix_g)
+            suffix_g = gcd(suffix_g, abs(free_terms[t][1]))
+    else:
+        gjs = [0] * nf
+    for t, (j, w) in enumerate(free_terms):
+        old_lo, old_hi = los[j], his[j]
+        gj = gjs[t]
+        if exact and gj > 1:
+            r = a - fixed  # w_j·x_j ≡ r (mod gj)
+            g0 = gcd(abs(w), gj)
+            if r % g0 != 0:
+                return None
+            modulus = gj // g0
+            if modulus > 1:
+                ww = (abs(w) // g0) % modulus
+                rr = ((r // g0) % modulus) * pow(ww, -1, modulus)
+                if w < 0:
+                    rr = (-rr) % modulus
+                rr %= modulus
+                low_v = los[j] + (rr - los[j]) % modulus
+                high_v = his[j] - (his[j] - rr) % modulus
+                if low_v > high_v:
+                    return None
+                if low_v > los[j]:
+                    los[j] = low_v
+                if high_v < his[j]:
+                    his[j] = high_v
+        if w > 0:
+            others_min = smin - w * old_lo
+            others_max = smax - w * old_hi
+        else:
+            others_min = smin - w * old_hi
+            others_max = smax - w * old_lo
+        if b is not None:  # w*x_j <= b - others_min
+            c = b - others_min
+            if w > 0:
+                v = c // w
+                if v < his[j]:
+                    his[j] = v
+            else:
+                v = _ceil_div(c, w)
+                if v > los[j]:
+                    los[j] = v
+        if a is not None:  # w*x_j >= a - others_max
+            c = a - others_max
+            if w > 0:
+                v = _ceil_div(c, w)
+                if v > los[j]:
+                    los[j] = v
+            else:
+                v = c // w
+                if v < his[j]:
+                    his[j] = v
+        if los[j] > his[j]:
+            return None
+        if los[j] != old_lo or his[j] != old_hi:
+            touched.append(j)
+    return touched
+
+
+def _build_occurrence(
+    var_count: int, constraints: list[Constraint]
+) -> list[list[int]]:
+    """变量 -> 含该变量的约束下标列表（约束在单次搜索内不变，只算一次）。"""
+    occurrence: list[list[int]] = [[] for _ in range(var_count)]
+    for ci, (terms, _a, _b) in enumerate(constraints):
+        for j, _w in terms:
+            occurrence[j].append(ci)
+    return occurrence
+
+
 def _propagate(
     los: list[int], his: list[int], constraints: list[Constraint],
     mod_check: bool = True,
+    occurrence: list[list[int]] | None = None,
 ) -> tuple[list[int], list[int]] | None:
-    """对所有线性区间约束反复做一元界传播；矛盾返回 None。
+    """对所有线性区间约束做增量一元界传播至不动点；矛盾返回 None。
 
-    每轮对每条约束只扫描其项两遍（O(约束数·项数)）：第一遍求
-    和的整体包络 [smin,smax]、自由变量包络与系数 gcd；第二遍用
-    「总和减去本项」做一元界收紧。
+    采用 AC-3 式队列：只有含「刚被收紧变量」的约束才需重新修订，
+    避免在每个搜索节点把全部约束重扫多遍。修订算子在有限整数格上
+    单调收缩，混沌迭代到不动点的结果与扫描次序无关，与原全扫描
+    实现逐值一致。occurrence 为变量→约束下标的静态索引，可在整棵
+    搜索树复用。
 
     mod_check 控制不动点处是否再跑模素数高斯消元。它只是剪枝（绝不影响
-    正确性：叶子点由各约束包络直接精确核对）。差分空间搜索的原始精确窗
-    方程组已在进入搜索前做过完整素数集预检，且搜索中新增的只是差分/绝对值
-    不等式，因此该路径关闭它以省去每节点的高斯消元开销。
+    正确性：叶子点由各约束包络直接精确核对）。差分/x+d 空间搜索的原始
+    精确窗方程组已在进入搜索前做过完整素数集预检，且搜索中新增的只是
+    差分/绝对值不等式，因此这些路径关闭它以省去每节点的高斯消元开销。
     """
     los = list(los)
     his = list(his)
-    while True:
-        changed = False
-        for terms, a, b in constraints:
-            # 本约束在本轮开始时的变量划分快照：即使本轮把某变量收紧成单点，
-            # 也要等下一轮再重算包络，避免 fixed/free 口径中途不一致。
-            fixed = 0
-            free_terms: list[tuple[int, int]] = []
-            free_min = 0
-            free_max = 0
-            g = 0
-            for j, w in terms:
-                if los[j] == his[j]:
-                    fixed += w * los[j]
-                else:
-                    free_terms.append((j, w))
-                    g = gcd(g, abs(w))
-                    if w > 0:
-                        free_min += w * los[j]
-                        free_max += w * his[j]
-                    else:
-                        free_min += w * his[j]
-                        free_max += w * los[j]
-            smin = free_min + fixed
-            smax = free_max + fixed
-            # gcd/包络快判：自由变量之和必为系数 gcd 的倍数，且必落在
-            # 其当前一元界包络内；与残差区间不交即矛盾（单点变量也在此
-            # 被核对，故后加入的精确约束与其冲突时不会漏检）。
-            rlo = None if a is None else a - fixed
-            rhi = None if b is None else b - fixed
-            lo_bound = free_min if rlo is None else max(free_min, rlo)
-            hi_bound = free_max if rhi is None else min(free_max, rhi)
-            if lo_bound > hi_bound:
-                return None
-            if g > 1:
-                first = lo_bound + ((-lo_bound) % g)
-                if first > hi_bound:
-                    return None
-            # 精确等式（lo==hi）的丢番图余数传播：其余自由变量系数的
-            # gcd g_j 决定 w_j·x_j 的余数类，据此把 x_j 的一元域收紧到
-            # 某个同余类（区间约束的右端不唯一时一般无此强结论，故仅对
-            # 等式做），显著压缩「精确观测窗」的回溯空间。
-            # 用前缀/后缀 gcd 令每个 g_j 只花 O(1)（整体 O(自由项数)）。
-            exact = a is not None and a == b
-            nf = len(free_terms)
-            if exact and nf >= 2:
-                pref = [0] * (nf + 1)
-                for t in range(nf):
-                    pref[t + 1] = gcd(pref[t], abs(free_terms[t][1]))
-                suffix_g = 0
-                gjs: list[int] = [0] * nf
-                for t in range(nf - 1, -1, -1):
-                    gjs[t] = gcd(pref[t], suffix_g)
-                    suffix_g = gcd(suffix_g, abs(free_terms[t][1]))
-            else:
-                gjs = [0] * nf
-            for t, (j, w) in enumerate(free_terms):
-                gj = gjs[t]
-                if exact and gj > 1:
-                    r = a - fixed  # w_j·x_j ≡ r (mod gj)
-                    g0 = gcd(abs(w), gj)
-                    if r % g0 != 0:
-                        return None
-                    modulus = gj // g0
-                    if modulus > 1:
-                        ww = (abs(w) // g0) % modulus
-                        rr = ((r // g0) % modulus) * pow(ww, -1, modulus)
-                        if w < 0:
-                            rr = (-rr) % modulus
-                        rr %= modulus
-                        low_v = los[j] + (rr - los[j]) % modulus
-                        high_v = his[j] - (his[j] - rr) % modulus
-                        if low_v > high_v:
-                            return None
-                        if low_v > los[j]:
-                            los[j] = low_v
-                            changed = True
-                        if high_v < his[j]:
-                            his[j] = high_v
-                            changed = True
-                if w > 0:
-                    others_min = smin - w * los[j]
-                    others_max = smax - w * his[j]
-                else:
-                    others_min = smin - w * his[j]
-                    others_max = smax - w * los[j]
-                if b is not None:  # w*x_j <= b - others_min
-                    c = b - others_min
-                    if w > 0:
-                        v = c // w
-                        if v < his[j]:
-                            his[j] = v
-                            changed = True
-                    else:
-                        v = _ceil_div(c, w)
-                        if v > los[j]:
-                            los[j] = v
-                            changed = True
-                if a is not None:  # w*x_j >= a - others_max
-                    c = a - others_max
-                    if w > 0:
-                        v = _ceil_div(c, w)
-                        if v > los[j]:
-                            los[j] = v
-                            changed = True
-                    else:
-                        v = c // w
-                        if v < his[j]:
-                            his[j] = v
-                            changed = True
-                if los[j] > his[j]:
-                    return None
-        if not changed:
-            # 传播到不动点后做有限域预检：纯整数（奇偶/模）矛盾在一元界
-            # 传播中不可见，但模素数高斯消元可立刻识别，避免回溯爆炸。
-            # 每个搜索节点都到这里，故只跑最小的两个素数以保持廉价；
-            # 已在上层做过完整素数集预检的路径可显式关闭。
-            if mod_check and not _mod_presolve(
-                los, his, constraints, _SEARCH_PRIMES
-            ):
-                return None
-            return los, his
+    if occurrence is None:
+        occurrence = _build_occurrence(len(los), constraints)
+    in_queue = [True] * len(constraints)
+    queue = list(range(len(constraints)))
+    head = 0
+    while head < len(queue):
+        ci = queue[head]
+        head += 1
+        in_queue[ci] = False
+        terms, a, b = constraints[ci]
+        touched = _revise(los, his, terms, a, b)
+        if touched is None:
+            return None
+        for j in touched:
+            for cj in occurrence[j]:
+                if not in_queue[cj]:
+                    in_queue[cj] = True
+                    queue.append(cj)
+    # 传播到不动点后做有限域预检：纯整数（奇偶/模）矛盾在一元界
+    # 传播中不可见，但模素数高斯消元可立刻识别，避免回溯爆炸。
+    # 每个搜索节点都到这里，故只跑最小的两个素数以保持廉价；
+    # 已在上层做过完整素数集预检的路径可显式关闭。
+    if mod_check and not _mod_presolve(
+        los, his, constraints, _SEARCH_PRIMES
+    ):
+        return None
+    return los, his
 
 
 def _static_priority(
@@ -597,11 +641,14 @@ def _choose_variable(
 def _search(
     los: list[int], his: list[int], constraints: list[Constraint],
     priority: list[tuple[int, int]] | None = None,
+    occurrence: list[list[int]] | None = None,
 ) -> tuple[int, ...] | None:
     """找一个可行赋值（MRV 变量序，域折半分支）；无可行解返回 None。"""
     if priority is None:
         priority = _static_priority(len(los), constraints)
-    narrowed = _propagate(los, his, constraints)
+    if occurrence is None:
+        occurrence = _build_occurrence(len(los), constraints)
+    narrowed = _propagate(los, his, constraints, occurrence=occurrence)
     if narrowed is None:
         return None
     los, his = narrowed
@@ -611,12 +658,12 @@ def _search(
     mid = (los[j] + his[j]) // 2
     lo2, hi2 = list(los), list(his)
     hi2[j] = mid
-    result = _search(lo2, hi2, constraints, priority)
+    result = _search(lo2, hi2, constraints, priority, occurrence)
     if result is not None:
         return result
     lo3, hi3 = list(los), list(his)
     lo3[j] = mid + 1
-    return _search(lo3, hi3, constraints, priority)
+    return _search(lo3, hi3, constraints, priority, occurrence)
 
 
 # --------------------------------------------------------------------------- #
@@ -640,20 +687,219 @@ def _diff_constraints(n: int, m: int) -> list[Constraint]:
     return cons
 
 
-def _abs_sum_constraints(n: int, m: int, s_lo: int | None, s_hi: int | None) -> list[Constraint]:
-    """e_k >= x_k-x_{k-1}、e_k >= x_{k-1}-x_k、0<=e_k<=M、Σe_k∈[s_lo,s_hi]。
+# --------------------------------------------------------------------------- #
+# x + d 联合空间：窗口约束保留 x 恒等系数，差分变量承载平滑目标
+# --------------------------------------------------------------------------- #
+def _combined_constraints(n: int) -> list[Constraint]:
+    """连接约束 x_k - x_{k-1} - d_k = 0。
 
-    在最优 M 较大（差分空间 d_k∈[-M,M] 过宽）时，阶段 2/3 仍在 x 空间
-    借助这些辅助变量做 S 的线性松弛判定（精确等价于 Σ|Δ|≤S）。
+    变量排布：x_0..x_{n-1} 占下标 0..n-1；d_k 占 n+k-1（k=1..n-1）。
+    观测窗约束保持 x 上的恒等系数（界传播最直接、最紧）；d_k 仅通过
+    三元精确等式与相邻 x 相连，任一两者固定即钉死第三者。第二级目标
+    直接是 Σ|d_k|，无需 e_k≥|d_k| 松弛变量（避免 e 可大于 |d| 造成的
+    重复解与海量分支），也无需把窗约束改写为冗长的差分累加式。
     """
     cons: list[Constraint] = []
     for k in range(1, n):
-        e_var = n + k - 1
-        cons.append((((e_var, 1), (k, -1), (k - 1, 1)), 0, None))
-        cons.append((((e_var, 1), (k, 1), (k - 1, -1)), 0, None))
-        cons.append((((e_var, 1),), 0, m))
-    cons.append((tuple((n + k - 1, 1) for k in range(1, n)), s_lo, s_hi))
+        dk = n + k - 1
+        cons.append((((k, 1), (k - 1, -1), (dk, -1)), 0, 0))
     return cons
+
+
+def _xd_narrow(
+    los: list[int],
+    his: list[int],
+    constraints: list[Constraint],
+    d_vars: list[int],
+    s_lo: int | None,
+    s_hi: int | None,
+    mod_check: bool = True,
+    occurrence: list[list[int]] | None = None,
+) -> tuple[list[int], list[int]] | None:
+    """线性界传播与「Σ|d| 对每个 d 域的收紧」联立不动点。
+
+        |d_k| <= (s_hi - Σ_{j≠k}|d_j|_lb)   （上界收紧）
+        |d_k| >= (s_lo - Σ_{j≠k}|d_j|_ub)   （符号已定时下界收紧）
+    随逐段钉死不断变紧。叶子处各 d 均为单点，两个总量判据即为对
+    Σ|d|∈[s_lo,s_hi] 的精确核对。
+    """
+    active = s_lo is not None or s_hi is not None
+    again = True
+    while again:
+        narrowed = _propagate(
+            los, his, constraints, mod_check=mod_check,
+            occurrence=occurrence,
+        )
+        if narrowed is None:
+            return None
+        los, his = narrowed
+        again = False
+        if active:
+            edge_lb = [0] * len(los)
+            edge_ub = [0] * len(los)
+            for k in d_vars:
+                edge_lb[k] = _abs_lb(los[k], his[k])
+                edge_ub[k] = max(abs(los[k]), abs(his[k]))
+            total_lb = sum(edge_lb[k] for k in d_vars)
+            total_ub = sum(edge_ub[k] for k in d_vars)
+            if s_hi is not None and total_lb > s_hi:
+                return None
+            if s_lo is not None and total_ub < s_lo:
+                return None
+            for k in d_vars:
+                if s_hi is not None:
+                    cap = s_hi - (total_lb - edge_lb[k])
+                    if cap < 0:
+                        return None
+                    new_lo = max(los[k], -cap)
+                    new_hi = min(his[k], cap)
+                    if new_lo > new_hi:
+                        return None
+                    if new_lo > los[k]:
+                        los[k] = new_lo
+                        again = True
+                    if new_hi < his[k]:
+                        his[k] = new_hi
+                        again = True
+                if s_lo is not None:
+                    need = s_lo - (total_ub - edge_ub[k])
+                    if need > 0:
+                        # |d_k| >= need；跨 0 域无法用一元界表达，仅在符号
+                        # 已定时收紧，否则交给后续分支。
+                        if los[k] >= 0:
+                            if los[k] < need:
+                                los[k] = need
+                                again = True
+                        elif his[k] <= 0:
+                            if his[k] > -need:
+                                his[k] = -need
+                                again = True
+                        if los[k] > his[k]:
+                            return None
+    return los, his
+
+
+def _signed_diff_sum_constraint(
+    n: int, los: list[int], his: list[int], d_vars: list[int],
+    s_lo: int | None, s_hi: int | None,
+) -> Constraint | None:
+    """所有 d_k 符号已定时，把 Σ|d_k| 写成 x 上的精确线性约束。
+
+    σ_k∈{+1,-1} 为 d_k 的符号，则 Σ_k σ_k d_k
+        = -σ_1·x_0 + Σ_{i=1..n-2}(σ_i-σ_{i+1})·x_i + σ_{n-1}·x_{n-1}，
+    系数仅在相邻符号翻转处为 ±2、两端为 ±1，比逐对绝对值收紧紧得多，
+    且经连接等式与观测窗互相传播。d_k=0（单点）时任取符号均不改变和。
+    """
+    sigma: dict[int, int] = {}
+    for k in d_vars:
+        if los[k] < 0 < his[k]:
+            return None  # 仍有跨 0 域，符号未定
+        sigma[k] = 1 if los[k] >= 0 else -1
+
+    def sig(k: int) -> int:  # k=1..n-1 对应 d_k，变量下标 n+k-1
+        return sigma[n + k - 1]
+
+    terms: list[tuple[int, int]] = []
+    c0 = -sig(1)
+    if c0:
+        terms.append((0, c0))
+    for i in range(1, n - 1):
+        c = sig(i) - sig(i + 1)
+        if c:
+            terms.append((i, c))
+    c_last = sig(n - 1)
+    if c_last:
+        terms.append((n - 1, c_last))
+    return tuple(terms), s_lo, s_hi
+
+
+def _xd_search(
+    los: list[int],
+    his: list[int],
+    constraints: list[Constraint],
+    d_vars: list[int],
+    s_lo: int | None,
+    s_hi: int | None,
+    priority: list[tuple[int, int]] | None = None,
+    occurrence: list[list[int]] | None = None,
+    signed: bool = False,
+) -> tuple[int, ...] | None:
+    """x+d 联合空间找一个可行赋值（MRV 变量序，域折半分支）。
+
+    窗口把 x 域压窄时优先分支 x，d_k 随即经精确连接等式钉死；
+    M 很小时 d_k∈[-M,M] 极窄，MRV 自然优先分支 d。两种极端都紧致。
+    occurrence（变量→约束索引）在整棵搜索树复用，只构建一次。
+
+    一旦全部 d_k 符号在当前域上确定，Σ|d_k| 即精确线性式，立刻补一条
+    x 上的短系数约束（见 _signed_diff_sum_constraint）参与传播；此后
+    该约束在整棵子树保持有效（域只缩不张、符号不会翻转）。
+    """
+    if priority is None:
+        priority = _static_priority(len(los), constraints)
+    if occurrence is None:
+        occurrence = _build_occurrence(len(los), constraints)
+    # (x,d) 只是对 x 做了可逆整数线性变换：精确窗方程的格一致性已由进入
+    # 阶段 2 前的一次性素数预检覆盖，连接等式只定义 d=x_k-x_{k-1}，
+    # 不引入新的整数矛盾。故关闭每节点模高斯消元（叶子仍精确核对）。
+    narrowed = _xd_narrow(
+        los, his, constraints, d_vars, s_lo, s_hi, mod_check=False,
+        occurrence=occurrence,
+    )
+    if narrowed is None:
+        return None
+    los, his = narrowed
+    if not signed and (s_lo is not None or s_hi is not None):
+        signed_cons = _signed_diff_sum_constraint(
+            len(los) - len(d_vars), los, his, d_vars, s_lo, s_hi
+        )
+        if signed_cons is not None:
+            constraints = constraints + [signed_cons]
+            idx = len(constraints) - 1
+            occurrence = [list(lst) for lst in occurrence]
+            for j, _w in signed_cons[0]:
+                occurrence[j].append(idx)
+            signed = True
+            re_narrowed = _xd_narrow(
+                los, his, constraints, d_vars, s_lo, s_hi,
+                mod_check=False, occurrence=occurrence,
+            )
+            if re_narrowed is None:
+                return None
+            los, his = re_narrowed
+    active_s = s_lo is not None or s_hi is not None
+    # Σ|d| 阈值活跃时，对跨 0 的 d_k 按符号分裂 [l,-1]/[0,h]：每支立即多
+    # 一个定号 d，全定号后 Σ|d| 的短系数线性约束上线，让「S 恰低 1」一类
+    # 不可行判定在浅层被剪掉。优先跨 0 且域最窄者（最接近被其他约束定号）。
+    if active_s and not signed:
+        wide_cross = [k for k in d_vars if los[k] < 0 < his[k]]
+        if wide_cross:
+            sign_var = min(wide_cross, key=lambda k: his[k] - los[k])
+            lo2, hi2 = list(los), list(his)
+            hi2[sign_var] = -1
+            result = _xd_search(lo2, hi2, constraints, d_vars, s_lo, s_hi,
+                                priority, occurrence, signed)
+            if result is not None:
+                return result
+            lo3, hi3 = list(los), list(his)
+            lo3[sign_var] = 0
+            return _xd_search(lo3, hi3, constraints, d_vars, s_lo, s_hi,
+                              priority, occurrence, signed)
+    # 到达此处时，若 S 阈值活跃则所有跨 0 d 已按符号分裂定号（signed 线性
+    # 约束已上线），故普通 MRV 折半即可。
+    j = _choose_variable(los, his, priority)
+    if j == -1:
+        return tuple(los)
+    mid = (los[j] + his[j]) // 2
+    lo2, hi2 = list(los), list(his)
+    hi2[j] = mid
+    result = _xd_search(lo2, hi2, constraints, d_vars, s_lo, s_hi,
+                        priority, occurrence, signed)
+    if result is not None:
+        return result
+    lo3, hi3 = list(los), list(his)
+    lo3[j] = mid + 1
+    return _xd_search(lo3, hi3, constraints, d_vars, s_lo, s_hi,
+                      priority, occurrence, signed)
 
 
 def _abs_lb(low: int, high: int) -> int:
@@ -667,6 +913,10 @@ def _abs_lb(low: int, high: int) -> int:
     return 0
 
 
+class _BudgetExceeded(Exception):
+    """单次可行性判定超过节点预算（用于 d 空间 → (x,d) 空间回退）。"""
+
+
 def _dspace_constraints(
     n: int, lengths: list[int], windows: list[Window],
     x_lo: list[int], x_hi: list[int],
@@ -675,8 +925,8 @@ def _dspace_constraints(
 
     x_k = x_0 + Σ_{j=1..k} d_j；观测窗以
         W_len·x_0 + Σ_j (Σ_{i∈窗,i≥j} L_i)·d_j ∈ [lo,hi]
-    表达。此变量下各 d_k 域仅为 [-M,M]（M 通常很小），
-    传播与回溯都远比 x 空间紧致。
+    表达。精确紧窗下该式传播很紧致；但松窗会令其失效（故仅在域宽
+    启发式判据有利且不超节点预算时使用，否则回退 (x,d) 联合空间）。
     """
     cons: list[Constraint] = []
     for k in range(1, n):  # x_k 的一元界翻译到 (x0, d1..dk)
@@ -703,24 +953,21 @@ def _dspace_search(
     constraints: list[Constraint],
     s_lo: int | None,
     s_hi: int | None,
-    priority: list[tuple[int, int]] | None = None,
+    priority: list[tuple[int, int]],
+    occurrence: list[list[int]],
+    budget: list[int] | None,
 ) -> tuple[int, ...] | None:
     """差分空间搜索；s_lo/s_hi 给出 Σ|d_k| 的闭区间（可缺省一端）。
 
-    线性界传播与「Σ|d| 对每个 d 域的收紧」联立求不动点：
-        |d_k| <= (s_hi - Σ_{j≠k}|d_j|_lb)   （上界收紧）
-        |d_k| >= (s_lo - Σ_{j≠k}|d_j|_ub)   （符号已定时下界收紧）
-    它会随逐段钉死不断变紧，无需求助 e_k 辅助变量，保持传播紧致。
+    线性界传播与「Σ|d| 对每个 d 域的收紧」联立求不动点。budget 为
+    单元素余量计数，节点耗尽即抛 _BudgetExceeded（由上层回退）。
     """
-    if priority is None:
-        priority = _static_priority(len(los), constraints)
     active = s_lo is not None or s_hi is not None
     again = True
     while again:
-        # 差分空间只是对 x 做了可逆整数线性变换，精确窗方程的格一致性已由
-        # 进入阶段 2 前的完整素数集预检覆盖；此处新增的仅为差分/绝对值
-        # 不等式。故关闭每节点的模高斯消元（叶子仍由各约束包络精确核对）。
-        narrowed = _propagate(los, his, constraints, mod_check=False)
+        narrowed = _propagate(
+            los, his, constraints, mod_check=False, occurrence=occurrence
+        )
         if narrowed is None:
             return None
         los, his = narrowed
@@ -767,18 +1014,31 @@ def _dspace_search(
                                 again = True
                         if los[k] > his[k]:
                             return None
+    if budget is not None:
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise _BudgetExceeded
     j = _choose_variable(los, his, priority)
     if j == -1:
         return tuple(los)
     mid = (los[j] + his[j]) // 2
     lo2, hi2 = list(los), list(his)
     hi2[j] = mid
-    result = _dspace_search(lo2, hi2, constraints, s_lo, s_hi, priority)
+    result = _dspace_search(
+        lo2, hi2, constraints, s_lo, s_hi, priority, occurrence, budget
+    )
     if result is not None:
         return result
     lo3, hi3 = list(los), list(his)
     lo3[j] = mid + 1
-    return _dspace_search(lo3, hi3, constraints, s_lo, s_hi, priority)
+    return _dspace_search(
+        lo3, hi3, constraints, s_lo, s_hi, priority, occurrence, budget
+    )
+
+
+# 单次差分空间可行性判定的节点预算：紧窗（如精确窗叠加）整解至多上万节点，
+# 松窗失效时单次判定即数十万乃至更多——超预算立刻回退 (x,d) 联合空间。
+_DSPACE_NODE_BUDGET = 12000
 
 
 def invert_payload(payload: object) -> dict:
@@ -807,26 +1067,66 @@ def invert_payload(payload: object) -> dict:
         raise InfeasibleError("observation windows are mutually inconsistent")
     full_range = strain_max - strain_min
 
-    def feasible_m(m: int) -> bool:
-        """|Δ|<=m 下是否存在整数解（x 空间，用于 M 的二分）。"""
+    # M 可行性判定在 x 空间：窗约束为 x 恒等系数、配二元差分不等式，
+    # 对紧域小 M 实例最直接。约束结构对所有 m 相同，静态索引只建一次。
+    m_occurrence = _build_occurrence(n, window_cons + _diff_constraints(n, 0))
+
+    def feasible_m(m: int) -> tuple[int, ...] | None:
+        """|Δ|<=m 下的一个整数解（x 空间，用于 M 的二分）；无解返回 None。
+
+        返回试解而非布尔值：其实际 max|Δ| 是更紧的可行上界，可直接
+        钉死二分上界，省去大量冗余可行性搜索。
+        """
         bounds = _x_diff_closure(n, base_x_lo, base_x_hi, m)
         if bounds is None:
-            return False
+            return None
         x_lo, x_hi = bounds
         constraints = list(window_cons)
         constraints += _diff_constraints(n, m)
-        return _search(list(x_lo), list(x_hi), constraints) is not None
+        return _search(
+            list(x_lo), list(x_hi), constraints, occurrence=m_occurrence
+        )
 
     # 阶段 0：无平滑约束（M = 全量程）下的整数可行性。
-    if not feasible_m(full_range):
-        raise InfeasibleError("observation windows are mutually inconsistent")
+    # 先用差分闭包（纯最长路，无回溯）二分「闭包一致」的最小 m：
+    # 闭包出现正环时连实解都不存在，整数最优 M 必不小于该下界，
+    # 且通常很接近它。从该下界起试解，避免在 m=全量程（差分约束
+    # 形同虚设、搜索在宽域上盲目回溯）上白白耗费一次判定。
+    def closure_ok(m: int) -> bool:
+        return _x_diff_closure(n, base_x_lo, base_x_hi, m) is not None
 
-    # 阶段 1：二分最小可行 M。
-    m_lo, m_hi = 0, full_range
+    m_low, m_high = 0, full_range
+    while m_low < m_high:
+        mid = (m_low + m_high) // 2
+        if closure_ok(mid):
+            m_high = mid
+        else:
+            m_low = mid + 1
+    m_closure = m_low
+
+    m_try = m_closure
+    while True:
+        stage0 = feasible_m(m_try)
+        if stage0 is not None:
+            break
+        if m_try >= full_range:
+            # 全量程仍整数无解（合法输入间彼此冲突）。
+            raise InfeasibleError(
+                "observation windows are mutually inconsistent"
+            )
+        m_try = min(full_range, max(m_try + 1, m_try * 2))
+    initial_m = max(
+        abs(stage0[k] - stage0[k - 1]) for k in range(1, n)
+    )
+
+    # 阶段 1：二分最小可行 M；每个可行试解的实际 max|Δ| 都收紧上界。
+    m_lo, m_hi = m_closure, initial_m
     while m_lo < m_hi:
         mid = (m_lo + m_hi) // 2
-        if feasible_m(mid):
-            m_hi = mid
+        sol = feasible_m(mid)
+        if sol is not None:
+            achieved = max(abs(sol[k] - sol[k - 1]) for k in range(1, n))
+            m_hi = min(mid, achieved)
         else:
             m_lo = mid + 1
     best_m = m_lo
@@ -836,51 +1136,63 @@ def invert_payload(payload: object) -> dict:
     assert bounds is not None
     x_lo, x_hi = bounds
 
-    # 阶段 2/3 的变量空间自适应选择：
-    #  - 最优 M 较小时，差分 d_k∈[-M,M] 极窄，用差分空间（无 e 辅助变量）；
-    #  - 最优 M 很大时，差分会把本已被闭包压窄的 x 域重新放宽到 2M+1，
-    #    仍在 x 空间用 e_k≥|Δ| 的线性松弛。判据为 d 域宽不超过最宽 x 域。
+    # 阶段 2/3 自适应选择求解变量空间：
+    #  - 最优 M 小、x 域宽且存在精确观测窗（lo==hi）时用差分空间：精确窗
+    #    的丢番图余数传播贯穿差分累加式，紧窄高效（如叠加的精确全长/内部
+    #    窗）；并以单次判定节点预算兜底，意外失效即回退。
+    #  - 仅有区间窗（尤其松弛较宽）时差分累加式传播很弱，直接用 (x,d)
+    #    联合空间：窗约束保留 x 恒等系数，d 经精确连接等式挂载。
     max_x_width = max(x_hi[i] - x_lo[i] for i in range(n))
-    use_dspace = (2 * best_m + 1) <= max_x_width
-
+    has_exact_window = any(w.lo == w.hi for w in unique_windows)
+    use_dspace = (
+        (2 * best_m + 1) <= max_x_width and has_exact_window
+    )
     if use_dspace:
-        strains = _optimize_dspace(
-            n, lengths, unique_windows, x_lo, x_hi, best_m,
-        )
+        try:
+            strains = _optimize_dspace_budgeted(
+                n, lengths, unique_windows, x_lo, x_hi, best_m
+            )
+        except _BudgetExceeded:
+            strains = _optimize_combined(
+                n, window_cons, x_lo, x_hi, best_m
+            )
     else:
-        strains = _optimize_xspace(
-            n, window_cons, x_lo, x_hi, best_m,
-        )
+        strains = _optimize_combined(n, window_cons, x_lo, x_hi, best_m)
 
     diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
     best_s = sum(abs(d) for d in diffs)
     return _build_result(lengths, windows, strains, diffs, best_m, best_s)
 
 
-def _optimize_dspace(
+def _optimize_dspace_budgeted(
     n: int, lengths: list[int], unique_windows: list[Window],
     x_lo: list[int], x_hi: list[int], best_m: int,
 ) -> list[int]:
-    """阶段 2/3：在差分空间 (x0,d1,..) 内最小化 Σ|d| 并钉死字典序。"""
+    """带节点预算的差分空间阶段 2/3；任一判定超预算即抛 _BudgetExceeded。"""
     d_base = _dspace_constraints(n, lengths, unique_windows, x_lo, x_hi)
 
     def d_domains() -> tuple[list[int], list[int]]:
-        d_lo = [x_lo[0]] + [-best_m] * (n - 1)
-        d_hi = [x_hi[0]] + [best_m] * (n - 1)
-        return d_lo, d_hi
+        return (
+            [x_lo[0]] + [-best_m] * (n - 1),
+            [x_hi[0]] + [best_m] * (n - 1),
+        )
 
-    # 一次性的完整素数集预检：阶段 1 可行 ⇒ 此处必有模解，断言仅作防御。
     d0_lo, d0_hi = d_domains()
     if not _mod_presolve(d0_lo, d0_hi, d_base):
         raise InfeasibleError("observation windows are mutually inconsistent")
+    d_priority = _static_priority(len(d0_lo), d_base)
+    d_occurrence = _build_occurrence(len(d0_lo), d_base)
 
     def feasible_s(
         s_lo: int | None, s_hi: int | None,
         d_lo: list[int], d_hi: list[int],
     ) -> tuple[int, ...] | None:
-        return _dspace_search(list(d_lo), list(d_hi), d_base, s_lo, s_hi)
+        return _dspace_search(
+            list(d_lo), list(d_hi), d_base, s_lo, s_hi,
+            d_priority, d_occurrence, [_DSPACE_NODE_BUDGET],
+        )
 
-    # 阶段 2：二分最小可行 S = Σ|Δ_k|；可行试解带回的实际 Σ|d| 可作更紧上界。
+    # 阶段 2：二分最小可行 S；可行试解的实际 Σ|d| 收紧上界。
     s_lo, s_hi = 0, (n - 1) * best_m
     while s_lo < s_hi:
         mid = (s_lo + s_hi) // 2
@@ -893,7 +1205,7 @@ def _optimize_dspace(
             s_lo = mid + 1
     best_s = s_lo
 
-    # 阶段 3：逐段钉死字典序最小值。前缀固定后「x_k<=t」即「d_k<=t-x_{k-1}」。
+    # 阶段 3：逐段钉死字典序最小值。
     strains: list[int] = []
     d_lo, d_hi = d_domains()
     for var in range(n):
@@ -910,7 +1222,9 @@ def _optimize_dspace(
                 trial_hi[0] = mid
             else:
                 trial_hi[var] = mid - strains[var - 1]
-            sol = feasible_s(best_s, best_s, trial_lo, trial_hi)
+            # S* 已是全局最小：前缀子问题里 S<=S* 与 S=S* 等价（理由同
+            # _optimize_combined），去下界让判定更容易。
+            sol = feasible_s(None, best_s, trial_lo, trial_hi)
             if sol is not None:
                 achieved = sol[0] if var == 0 else strains[var - 1] + sol[var]
                 t_hi = min(mid, achieved)
@@ -924,54 +1238,73 @@ def _optimize_dspace(
     return strains
 
 
-def _optimize_xspace(
+def _optimize_combined(
     n: int, window_cons: list[Constraint],
     x_lo: list[int], x_hi: list[int], best_m: int,
 ) -> list[int]:
-    """阶段 2/3：最优 M 很大时仍在 x 空间用 e_k≥|Δ| 的线性松弛。"""
-    def feasible_x(s_cap: int) -> tuple[int, ...] | None:
-        lo = list(x_lo)
-        hi = list(x_hi)
-        constraints = list(window_cons)
-        constraints += _diff_constraints(n, best_m)
-        lo += [0] * (n - 1)
-        hi += [best_m] * (n - 1)
-        constraints += _abs_sum_constraints(n, best_m, None, s_cap)
-        return _search(lo, hi, constraints)
+    """阶段 2/3：最优 M 很大时在 (x,d) 联合空间求解。
 
+    窗口约束保留 x 恒等系数（对 x 的界传播最紧）；d_k=x_k-x_{k-1} 经精确
+    连接等式挂载，第二级目标直接取 Σ|d_k|（无 e 松弛、无重复解）；
+    第三级逐段钉死 x 的字典序。
+    """
+    d_vars = list(range(n, 2 * n - 1))
+    linking = _combined_constraints(n)
+    base_constraints = list(window_cons) + linking
+    # 仅一元界：x 来自最优 M 下的差分闭包，d_k∈[-M,M]。
+    base_lo = list(x_lo) + [-best_m] * (n - 1)
+    base_hi = list(x_hi) + [best_m] * (n - 1)
+    xd_priority = _static_priority(2 * n - 1, base_constraints)
+    xd_occurrence = _build_occurrence(2 * n - 1, base_constraints)
+
+    def feasible_s(s_cap: int) -> tuple[int, ...] | None:
+        return _xd_search(
+            list(base_lo), list(base_hi), base_constraints,
+            d_vars, None, s_cap,
+            priority=xd_priority, occurrence=xd_occurrence,
+        )
+
+    # 阶段 2：二分最小可行 S = Σ|Δ_k|；可行试解的实际 Σ|d| 收紧上界。
     s_lo, s_hi = 0, (n - 1) * best_m
     while s_lo < s_hi:
         mid = (s_lo + s_hi) // 2
-        sol = feasible_x(mid)
+        sol = feasible_s(mid)
         if sol is not None:
-            achieved = sum(abs(sol[k] - sol[k - 1]) for k in range(1, n))
+            achieved = sum(abs(sol[n + k - 1]) for k in range(1, n))
             s_hi = min(mid, achieved)
         else:
             s_lo = mid + 1
     best_s = s_lo
 
-    constraints = list(window_cons)
-    constraints += _diff_constraints(n, best_m)
-    constraints += _abs_sum_constraints(n, best_m, best_s, best_s)
-    lo = list(x_lo) + [0] * (n - 1)
-    hi = list(x_hi) + [best_m] * (n - 1)
-
+    # 阶段 3：逐段钉死 x 的字典序最小值（前缀 x<=t 为一条一元上界）。
+    # 只需约束 S <= best_s：S* 已在阶段 2 证明为全局最小，任何前缀子问题
+    # 若存在 S < S* 的补全都会与最小性矛盾，故 S<=S* 与 S=S* 在此等价，
+    # 但去掉下界后判定显著更容易（少了最难满足的总量下界剪枝压力）。
+    los, his = list(base_lo), list(base_hi)
     strains: list[int] = []
     for var in range(n):
-        t_lo, t_hi = lo[var], hi[var]
+        t_lo, t_hi = los[var], his[var]
         while t_lo < t_hi:
             mid = (t_lo + t_hi) // 2
-            trial = constraints + [(((var, 1),), None, mid)]
-            sol = _search(list(lo), list(hi), trial)
+            trial_lo, trial_hi = list(los), list(his)
+            trial_hi[var] = mid
+            sol = _xd_search(
+                trial_lo, trial_hi, base_constraints,
+                d_vars, None, best_s,
+                priority=xd_priority, occurrence=xd_occurrence,
+            )
             if sol is not None:
                 t_hi = min(mid, sol[var])
             else:
                 t_lo = mid + 1
         strains.append(t_lo)
-        lo[var] = hi[var] = t_lo
-        narrowed = _propagate(lo, hi, constraints)
+        los[var] = his[var] = t_lo
+        narrowed = _xd_narrow(
+            los, his, base_constraints, d_vars, None, best_s,
+            occurrence=xd_occurrence,
+        )
         assert narrowed is not None  # 已选最优值必然可行
-        lo, hi = narrowed
+        los, his = narrowed
     return strains
 
 

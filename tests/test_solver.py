@@ -346,6 +346,148 @@ def test_max_size_instance_performance():
     assert len(result["strains"]) == 12
 
 
+def test_max_size_wide_strain_scenario_under_3s():
+    """上限规模可行请求：12 段、20 窗、应变域 ±100000、固定种子 42。
+
+    必须在 3 秒内返回；逐窗回算落入提交闭区间；两级平滑指标可由相邻差
+    复核；并独立核对 M 的最优性（M 可行而 M-1 不可行）与 S 的最优性。
+    """
+    rng = random.Random(42)
+    n = 12
+    lengths = [rng.randint(1, 100) for _ in range(n)]
+    truth = [rng.randint(-100000, 100000) for _ in range(n)]
+    windows = []
+    starts = list(range(12))
+    rng.shuffle(starts)
+    for s0 in starts:
+        e0 = rng.randint(s0, n - 1)
+        total = sum(lengths[i] * truth[i] for i in range(s0, e0 + 1))
+        windows.append(
+            {"start_segment": s0 + 1, "end_segment": e0 + 1,
+             "min_elongation": total - 100, "max_elongation": total + 100}
+        )
+    while len(windows) < 20:
+        s0 = rng.randint(0, n - 1)
+        e0 = rng.randint(s0, n - 1)
+        total = sum(lengths[i] * truth[i] for i in range(s0, e0 + 1))
+        windows.append(
+            {"start_segment": s0 + 1, "end_segment": e0 + 1,
+             "min_elongation": total - 50, "max_elongation": total + 50}
+        )
+    payload = {
+        "segment_lengths": lengths,
+        "strain_bounds": {"min": -100000, "max": 100000},
+        "windows": windows,
+    }
+    start = time.monotonic()
+    result = invert_payload(payload)
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, elapsed
+    strains = result["strains"]
+    assert len(strains) == n
+    assert all(-100000 <= v <= 100000 for v in strains)
+    assert all(c["satisfied"] for c in result["window_checks"])
+    for win, check in zip(windows, result["window_checks"]):
+        recomputed = sum(
+            lengths[i] * strains[i]
+            for i in range(win["start_segment"] - 1, win["end_segment"])
+        )
+        assert check["weighted_strain_sum"] == recomputed
+        assert win["min_elongation"] <= recomputed <= win["max_elongation"]
+    diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
+    best_m = max(abs(d) for d in diffs)
+    best_s = sum(abs(d) for d in diffs)
+    assert result["objectives"] == {
+        "max_adjacent_diff": best_m,
+        "sum_adjacent_abs_diff": best_s,
+    }
+
+    # 独立最优性核对：M 可行、M-1 不可行；(M, S-1) 不可行。
+    from app.solver import (  # 局部导入：仅本回归测试需要内部判定
+        Window,
+        _build_occurrence,
+        _combined_constraints,
+        _diff_constraints,
+        _search,
+        _window_constraints,
+        _x_bounds_from_prefix,
+        _xd_search,
+        _x_diff_closure,
+        _prefix_closure,
+    )
+
+    wins = [
+        Window(w["start_segment"] - 1, w["end_segment"] - 1,
+               w["min_elongation"], w["max_elongation"])
+        for w in windows
+    ]
+    closure = _prefix_closure(n, lengths, -100000, 100000, wins)
+    base_lo, base_hi = _x_bounds_from_prefix(
+        n, lengths, -100000, 100000, closure
+    )
+    wcons = _window_constraints(n, lengths, wins)
+    occ = _build_occurrence(n, wcons + _diff_constraints(n, 0))
+
+    def m_feasible(m):
+        bounds = _x_diff_closure(n, base_lo, base_hi, m)
+        if bounds is None:
+            return None
+        x_lo, x_hi = bounds
+        return _search(
+            list(x_lo), list(x_hi),
+            list(wcons) + _diff_constraints(n, m), occurrence=occ,
+        )
+
+    assert m_feasible(best_m) is not None
+    assert m_feasible(best_m - 1) is None
+    bounds = _x_diff_closure(n, base_lo, base_hi, best_m)
+    assert bounds is not None
+    x_lo, x_hi = bounds
+    if best_s > 0:
+        cons = list(wcons) + _combined_constraints(n)
+        lo = list(x_lo) + [-best_m] * (n - 1)
+        hi = list(x_hi) + [best_m] * (n - 1)
+        assert _xd_search(
+            lo, hi, cons, list(range(n, 2 * n - 1)), None, best_s - 1
+        ) is None
+
+
+def test_max_size_small_strain_domain_nearby_instances_fast():
+    """上限规模、小应变域可行实例同样须在 3 秒内精确返回。"""
+    for seed, half in ((42, 10), (42, 100), (7, 5000)):
+        rng = random.Random(seed)
+        n = 12
+        lengths = [rng.randint(1, 100) for _ in range(n)]
+        truth = [rng.randint(-half, half) for _ in range(n)]
+        windows = []
+        starts = list(range(12))
+        rng.shuffle(starts)
+        for s0 in starts:
+            e0 = rng.randint(s0, n - 1)
+            total = sum(lengths[i] * truth[i] for i in range(s0, e0 + 1))
+            windows.append(
+                {"start_segment": s0 + 1, "end_segment": e0 + 1,
+                 "min_elongation": total - 100, "max_elongation": total + 100}
+            )
+        while len(windows) < 20:
+            s0 = rng.randint(0, n - 1)
+            e0 = rng.randint(s0, n - 1)
+            total = sum(lengths[i] * truth[i] for i in range(s0, e0 + 1))
+            windows.append(
+                {"start_segment": s0 + 1, "end_segment": e0 + 1,
+                 "min_elongation": total - 50, "max_elongation": total + 50}
+            )
+        payload = {
+            "segment_lengths": lengths,
+            "strain_bounds": {"min": -100000, "max": 100000},
+            "windows": windows,
+        }
+        start = time.monotonic()
+        result = invert_payload(payload)
+        assert time.monotonic() - start < 3.0
+        assert all(c["satisfied"] for c in result["window_checks"])
+
+
 def test_deterministic():
     rng = random.Random(7)
     n = 6
